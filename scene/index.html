@@ -1,0 +1,554 @@
+<!doctype html>
+<!-- 3D Titanic scene: a two-way Streamlit component, declared in titanic_dashboard.py.
+     Clicking a lifeboat, a person or a lifebelt sends a filter back to the dashboard.
+     Needs internet for three.js (CDN). Opened on its own, it uses built-in sample counts. -->
+<html>
+<head>
+<meta charset="utf-8">
+<style>
+  html, body { margin: 0; height: 100%; overflow: hidden; background: #071422; font-family: Georgia, serif; }
+  canvas { display: block; touch-action: manipulation; }
+  .panel {
+    position: absolute; color: #f4efe4; background: rgba(7, 20, 34, 0.78);
+    border: 1px solid rgba(212, 175, 55, 0.35); border-radius: 3px;
+  }
+  #legend {
+    top: 10px; left: 12px; max-width: calc(100% - 270px); min-width: 200px;
+    padding: 7px 10px; font-size: 12px; line-height: 1.6; pointer-events: none;
+  }
+  #legend i { display: inline-block; width: 10px; height: 10px; border-radius: 50%; margin: 0 3px 0 7px; vertical-align: -1px; }
+  #legend .hint { color: #c9b896; }
+  #filter { color: #d4af37; font-weight: 600; }
+  #bar { position: absolute; top: 10px; right: 12px; display: flex; gap: 6px; }
+  button {
+    font: 13px Georgia, serif; color: #f4efe4; background: rgba(16, 32, 51, 0.9);
+    border: 1px solid rgba(212, 175, 55, 0.55); border-radius: 3px; padding: 5px 10px; cursor: pointer;
+  }
+  button:hover { background: #16304a; border-color: #d4af37; }
+  button:focus-visible { outline: 2px solid #d4af37; outline-offset: 2px; }
+  #tip { display: none; padding: 6px 9px; font-size: 13px; line-height: 1.45; pointer-events: none; white-space: nowrap; z-index: 2; }
+  #tip b { color: #d4af37; }
+  #tip small { color: #c9b896; }
+  #note {
+    position: absolute; bottom: 12px; left: 16px; font: 600 15px Georgia, serif; color: #f4efe4;
+    text-shadow: 0 1px 4px #000; opacity: 0; transition: opacity 0.6s; pointer-events: none;
+  }
+  @media (max-width: 560px) {
+    #legend { max-width: calc(100% - 24px); top: 50px; font-size: 11px; }
+  }
+</style>
+</head>
+<body>
+<div id="legend" class="panel">
+  <div>Clothes:<i style="background:#d4af37"></i>1st<i style="background:#9ec3db"></i>2nd<i style="background:#c0634a"></i>3rd class</div>
+  <div>Dress = woman · suit = man · one figure ≈ <span id="per">15</span> passengers</div>
+  <div>Lifeboat = survived · lifebelt in the water = died</div>
+  <div class="hint">Click a lifeboat, a person or a lifebelt to filter the page.</div>
+  <div>Showing: <span id="filter">everyone</span></div>
+</div>
+<div id="bar">
+  <button id="everyone" type="button">Everyone</button>
+  <button id="pause" type="button">Pause</button>
+  <button id="replay" type="button">Replay</button>
+</div>
+<div id="tip" class="panel"></div>
+<div id="note"></div>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+<script>
+  const HEIGHT = 520;
+  const SAIL = 10, SINK = 16;           // seconds: sailing to the iceberg, ship going under
+  const START_X = -90, HIT_X = -25;     // ship centre; bow is 20 ahead of it
+  const LOWER = 1.8;                    // seconds to lower a lifeboat
+  const SCALE = 1.3;                    // people are drawn far larger than life so they can be clicked
+  const CLASS_COLOR = { 1: 0xd4af37, 2: 0x9ec3db, 3: 0xc0634a };
+  const CLASS_NAME = { 1: "1st", 2: "2nd", 3: "3rd" };
+  const ALL = { sexes: ["male", "female"], classes: [1, 2, 3], outcomes: [0, 1] };
+  // Counts from data/titanic.csv, used only when the page is opened outside Streamlit.
+  const FALLBACK = [
+    ["female", 1, 0, 3], ["female", 1, 1, 91], ["female", 2, 0, 6], ["female", 2, 1, 70],
+    ["female", 3, 0, 72], ["female", 3, 1, 72], ["male", 1, 0, 77], ["male", 1, 1, 45],
+    ["male", 2, 0, 91], ["male", 2, 1, 17], ["male", 3, 0, 300], ["male", 3, 1, 47],
+  ].map(([sex, cls, survived, n]) => ({ sex, cls, survived, n }));
+
+  // ---------- Streamlit component protocol ----------
+  const send = (type, data) => parent.postMessage({ isStreamlitMessage: true, type, ...data }, "*");
+  let sel = ALL, built = false;
+  addEventListener("message", (e) => {
+    const d = e.data;
+    if (!d || d.type !== "streamlit:render") return;
+    const a = d.args || {};
+    if (!built) build(a.groups || FALLBACK, a.per || 15);
+    if (a.selection) sel = a.selection;
+    applySelection();
+  });
+  send("streamlit:componentReady", { apiVersion: 1 });
+  send("streamlit:setFrameHeight", { height: HEIGHT });
+  // Opened on its own (not inside Streamlit): use the built-in counts.
+  setTimeout(() => { if (!built) { build(FALLBACK, 15); applySelection(); } }, parent === window ? 0 : 4000);
+
+  // ---------- helpers ----------
+  const clamp = (v, a, b) => Math.min(Math.max(v, a), b);
+  const ease = (k) => k * k * (3 - 2 * k);
+  const lerp = (a, b, k) => a + (b - a) * k;
+  const wave = (x, z, t) => Math.sin(x * 0.15 + t) * 0.35 + Math.cos(z * 0.2 + t * 0.8) * 0.3;
+  function rng(seed) { // mulberry32: the same layout every load
+    return () => {
+      seed |= 0; seed = (seed + 0x6d2b79f5) | 0;
+      let r = Math.imul(seed ^ (seed >>> 15), 1 | seed);
+      r = (r + Math.imul(r ^ (r >>> 7), 61 | r)) ^ r;
+      return ((r ^ (r >>> 14)) >>> 0) / 4294967296;
+    };
+  }
+  const rand = rng(1912);
+  const shuffle = (list) => { for (let i = list.length - 1; i > 0; i--) { const j = Math.floor(rand() * (i + 1)); [list[i], list[j]] = [list[j], list[i]]; } return list; };
+
+  // ---------- scene ----------
+  const scene = new THREE.Scene();
+  scene.background = new THREE.Color(0x071422);
+  scene.fog = new THREE.Fog(0x071422, 60, 170);
+  const camera = new THREE.PerspectiveCamera(45, 1, 0.1, 500);
+  const renderer = new THREE.WebGLRenderer({ antialias: true });
+  renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+  document.body.appendChild(renderer.domElement);
+  const canvas = renderer.domElement;
+
+  scene.add(new THREE.AmbientLight(0x8fa8d8, 0.6));
+  const moon = new THREE.DirectionalLight(0xdfe8ff, 0.95);
+  moon.position.set(-30, 50, 40);
+  scene.add(moon);
+
+  const mat = (color, extra) => new THREE.MeshStandardMaterial({ color, flatShading: true, ...extra });
+  const box = (w, h, d, m, x, y, z) => {
+    const mesh = new THREE.Mesh(new THREE.BoxGeometry(w, h, d), m);
+    mesh.position.set(x, y, z || 0);
+    return mesh;
+  };
+  const hitMat = new THREE.MeshBasicMaterial({ transparent: true, opacity: 0, depthWrite: false });
+  const hitMeshes = [];
+  function addHit(parent, target, shape, y) { // shape: a radius (sphere) or a geometry
+    const geo = typeof shape === "number" ? new THREE.SphereGeometry(shape, 8, 6) : shape;
+    const hit = new THREE.Mesh(geo, hitMat);
+    hit.position.y = y;
+    hit.userData.target = target;
+    parent.add(hit);
+    hitMeshes.push(hit);
+  }
+
+  // Ship: bow points +x, 40 long, 5 wide.
+  const ship = new THREE.Group();
+  const deck = new THREE.Shape();
+  deck.moveTo(20, 0);
+  deck.quadraticCurveTo(12, 2.5, 4, 2.5);
+  deck.lineTo(-16, 2.5);
+  deck.quadraticCurveTo(-20, 2.5, -20, 0);
+  deck.quadraticCurveTo(-20, -2.5, -16, -2.5);
+  deck.lineTo(4, -2.5);
+  deck.quadraticCurveTo(12, -2.5, 20, 0);
+  const hullGeo = new THREE.ExtrudeGeometry(deck, { depth: 4, bevelEnabled: false });
+  hullGeo.rotateX(-Math.PI / 2);
+  ship.add(new THREE.Mesh(hullGeo, mat(0x15171c)));
+  ship.add(box(26, 1.6, 4, mat(0xf2f0e8), -2, 4.8));
+  ship.add(box(26.2, 0.35, 4.1, mat(0xffd98a, { emissive: 0xffc04d }), -2, 4.9)); // lit windows
+  ship.add(box(20, 1.2, 3.2, mat(0xf2f0e8), -2, 6.2));
+  for (let i = 0; i < 4; i++) {
+    const funnel = new THREE.Mesh(new THREE.CylinderGeometry(0.85, 0.95, 4.5, 12), mat(0xd9a441));
+    funnel.position.set(5.5 - i * 5, 9, 0);
+    funnel.rotation.z = 0.12;
+    const cap = new THREE.Mesh(new THREE.CylinderGeometry(0.87, 0.87, 1, 12), mat(0x111111));
+    cap.position.y = 2.6;
+    funnel.add(cap);
+    ship.add(funnel);
+  }
+  for (const x of [14, -15]) {
+    const mast = new THREE.Mesh(new THREE.CylinderGeometry(0.08, 0.12, 9, 6), mat(0x6b4a2b));
+    mast.position.set(x, 8.5, 0);
+    ship.add(mast);
+  }
+  scene.add(ship);
+
+  const ice = mat(0xdff3ff, { roughness: 0.35 });
+  for (const [r, h, x, z] of [[6, 13, 1, -4], [4, 8, -3, -7], [3.5, 6, 5, -8], [3, 4, -1, -1]]) {
+    const peak = new THREE.Mesh(new THREE.ConeGeometry(r, h, 6), ice);
+    peak.position.set(x, h / 2 - 0.5, z);
+    peak.rotation.y = x;
+    scene.add(peak);
+  }
+
+  const seaGeo = new THREE.PlaneGeometry(400, 400, 60, 60);
+  seaGeo.rotateX(-Math.PI / 2);
+  scene.add(new THREE.Mesh(seaGeo, mat(0x0b2a4a, { roughness: 0.6 })));
+  const seaPos = seaGeo.attributes.position;
+
+  const stars = new Float32Array(900);
+  for (let i = 0; i < 900; i += 3) {
+    const a = Math.random() * Math.PI * 2, e = Math.random() * 1.2 + 0.15;
+    stars.set([Math.cos(a) * Math.cos(e) * 300, Math.sin(e) * 300, Math.sin(a) * Math.cos(e) * 300], i);
+  }
+  const starGeo = new THREE.BufferGeometry();
+  starGeo.setAttribute("position", new THREE.BufferAttribute(stars, 3));
+  scene.add(new THREE.Points(starGeo, new THREE.PointsMaterial({ color: 0xffffff, size: 1.2, fog: false })));
+
+  // Ship motion is a pure function of time, so Replay just resets the clock.
+  function shipPose(t) {
+    const sink = clamp((t - SAIL) / SINK, 0, 1);
+    const sailed = Math.min(t / SAIL, 1);
+    return {
+      x: START_X + (HIT_X - START_X) * sailed,
+      y: -1 + Math.sin(t * 1.3) * 0.15 * (1 - sink) - 24 * ease(sink),
+      rz: -0.5 * ease(Math.min(sink * 1.6, 1)), // bow goes down first
+      rx: 0.12 * ease(sink),
+    };
+  }
+  const probe = new THREE.Object3D();
+  function shipPoint(t, lx, ly, lz) { // a point on the ship, in world space, at time t
+    const p = shipPose(t);
+    probe.position.set(p.x, p.y, 1.5);
+    probe.rotation.set(p.rx, 0, p.rz);
+    probe.updateMatrixWorld(true);
+    return probe.localToWorld(new THREE.Vector3(lx, ly, lz));
+  }
+
+  // ---------- people, lifeboats, lifebelts ----------
+  function makePerson(sex, cls) {
+    const g = new THREE.Group();
+    const cloth = mat(CLASS_COLOR[cls]);
+    const skin = mat(0xe6c3a1);
+    const dark = mat(sex === "female" ? 0x3a2618 : 0x1d1f26);
+    if (sex === "female") {
+      const dress = new THREE.Mesh(new THREE.ConeGeometry(0.42, 0.9, 10), cloth);
+      dress.position.y = 0.45;
+      g.add(dress, box(0.34, 0.42, 0.24, cloth, 0, 1.08));
+      const hair = new THREE.Mesh(new THREE.SphereGeometry(0.17, 10, 8), dark);
+      hair.position.set(0, 1.43, -0.04);
+      g.add(hair);
+    } else {
+      g.add(box(0.3, 0.62, 0.2, dark, 0, 0.31), box(0.42, 0.55, 0.26, cloth, 0, 0.9));
+    }
+    const head = new THREE.Mesh(new THREE.SphereGeometry(0.15, 10, 8), skin);
+    head.position.y = 1.36;
+    g.add(head);
+    const arms = [-1, 1].map((side) => {
+      const pivot = new THREE.Group();
+      pivot.position.set(side * 0.24, 1.18, 0);
+      pivot.add(box(0.09, 0.46, 0.09, cloth, 0, -0.23));
+      g.add(pivot);
+      return pivot;
+    });
+    g.scale.setScalar(SCALE);
+    return { group: g, arms, mats: [cloth, skin, dark] };
+  }
+  const setArms = (arms, a) => { arms[0].rotation.z = -a; arms[1].rotation.z = a; }; // 0 = down, π = straight up
+
+  function makeBoat() {
+    const g = new THREE.Group();
+    const plan = new THREE.Shape();
+    plan.moveTo(1.8, 0);
+    plan.quadraticCurveTo(1.2, 0.7, 0.6, 0.7);
+    plan.lineTo(-0.9, 0.7);
+    plan.quadraticCurveTo(-1.8, 0.7, -1.8, 0);
+    plan.quadraticCurveTo(-1.8, -0.7, -0.9, -0.7);
+    plan.lineTo(0.6, -0.7);
+    plan.quadraticCurveTo(1.2, -0.7, 1.8, 0);
+    const geo = new THREE.ExtrudeGeometry(plan, { depth: 0.55, bevelEnabled: false });
+    geo.rotateX(-Math.PI / 2);
+    const hull = mat(0xe9e4d6), wood = mat(0x7a5232);
+    g.add(new THREE.Mesh(geo, hull), box(3.0, 0.08, 1.2, wood, -0.1, 0.5));
+    g.add(new THREE.Mesh(new THREE.CylinderGeometry(0.06, 0.06, 0.3, 6), mat(0xffd98a, { emissive: 0xffb84d })).translateX(1.4).translateY(0.75)); // lantern
+    return { group: g, mats: [hull, wood] };
+  }
+
+  function makeRing(cls) {
+    const m = mat(CLASS_COLOR[cls]);
+    const ring = new THREE.Mesh(new THREE.TorusGeometry(0.5, 0.16, 8, 18), m);
+    ring.rotation.x = Math.PI / 2;
+    const g = new THREE.Group();
+    g.add(ring);
+    return { group: g, mats: [m] };
+  }
+
+  const records = [], boats = [], swimmers = [];
+  const DAVITS = [11, 7.5, 4, -6, -9.5, -13];
+
+  function build(groups, per) {
+    built = true;
+    document.getElementById("per").textContent = per;
+    const saved = [], lost = [];
+    for (const g of groups) {
+      const figures = g.n > 0 ? Math.max(1, Math.round(g.n / per)) : 0;
+      for (let i = 0; i < figures; i++) (g.survived ? saved : lost).push(g);
+    }
+    shuffle(saved);
+    shuffle(lost);
+    const totalSaved = groups.filter((g) => g.survived).reduce((s, g) => s + g.n, 0);
+
+    // Lifeboats, bow davits first, alternating sides. Each carries a share of the survivors.
+    const nBoats = clamp(Math.ceil(saved.length / 3), Math.min(4, saved.length), DAVITS.length * 2);
+    for (let i = 0; i < nBoats; i++) {
+      const b = makeBoat();
+      const rec = {
+        kind: "boat", n: totalSaved, ...b,
+        lx: DAVITS[i >> 1], side: i % 2 ? -1 : 1,
+        release: 10.8 + i * 0.25,
+        dist: 7 + rand() * 7, dx: (rand() - 0.5) * 10, ph: rand() * 6,
+      };
+      rec.drop = shipPoint(rec.release, rec.lx, 5.4, rec.side * 3.2);
+      addHit(b.group, rec, new THREE.BoxGeometry(3.8, 0.8, 1.6), 0.25);
+      scene.add(b.group);
+      boats.push(rec);
+      records.push(rec);
+    }
+    saved.forEach((g, i) => {
+      const boat = boats[i % nBoats];
+      const seat = Math.floor(i / nBoats);
+      const seats = Math.ceil((saved.length - (i % nBoats)) / nBoats);
+      const person = makePerson(g.sex, g.cls);
+      person.group.scale.setScalar(SCALE * 0.75);
+      person.group.position.set(seats > 1 ? lerp(-1.1, 1.0, seat / (seats - 1)) : 0, -0.15, seat % 2 ? 0.22 : -0.22);
+      person.group.rotation.y = Math.PI / 2;
+      setArms(person.arms, 0.3);
+      boat.group.add(person.group);
+      const rec = { kind: "person", ...g, ...person };
+      addHit(person.group, rec, 0.45, 1.15); // torso and head, above the gunwale
+      records.push(rec);
+    });
+
+    // People who end up in the water. Each jumps from a part of the deck still above the sea.
+    for (const g of lost) {
+      const side = rand() < 0.5 ? 1 : -1;
+      let f = 12.6 + rand() * 4.6, lx = -19, P = null;
+      for (let tries = 0; tries < 40 && !P; tries++) {
+        const cand = -19 + rand() * 27;
+        const w = shipPoint(f, cand, 5.6, side * 1.85);
+        if (w.y > 2) { lx = cand; P = w; }
+        else if (tries % 10 === 9) f -= 0.8;
+      }
+      if (!P) P = shipPoint(f, lx, 5.6, side * 1.85);
+      const v = new THREE.Vector3((rand() - 0.5) * 1.6, 2.2 + rand(), side * (2.4 + rand() * 2.6));
+      const fall = (v.y + Math.sqrt(v.y * v.y + 19.6 * Math.max(P.y, 0))) / 9.8;
+      const person = makePerson(g.sex, g.cls);
+      const ring = makeRing(g.cls);
+      const splash = new THREE.Mesh(
+        new THREE.RingGeometry(0.3, 0.6, 20).rotateX(-Math.PI / 2),
+        new THREE.MeshBasicMaterial({ color: 0xffffff, transparent: true, depthWrite: false })
+      );
+      const rec = {
+        kind: "person", ...g, ...person, mats: [...person.mats, ...ring.mats],
+        ring: ring.group, splash, lx, side, f, P, v, fall,
+        land: new THREE.Vector3(P.x + v.x * fall, 0, P.z + v.z * fall),
+        struggle: 3.5 + rand() * 5, yaw: rand() * Math.PI * 2, ph: rand() * 10,
+      };
+      addHit(person.group, rec, 0.75, 0.9);
+      addHit(ring.group, rec, 1.0, 0);
+      scene.add(person.group, ring.group, splash);
+      swimmers.push(rec);
+      records.push(rec);
+    }
+  }
+
+  function placeBoat(b, t, pose) {
+    const g = b.group;
+    if (t < b.release) { // still hanging from the davits
+      g.position.copy(shipPoint(t, b.lx, 5.4, b.side * 3.2));
+      g.rotation.set(pose.rx, 0, pose.rz);
+      return;
+    }
+    const k = (t - b.release) / LOWER;
+    if (k < 1) {
+      g.position.set(b.drop.x, lerp(b.drop.y, wave(b.drop.x, b.drop.z, t) + 0.05, ease(k)), b.drop.z);
+      g.rotation.set(0, 0, 0);
+      return;
+    }
+    const away = 1 - Math.exp(-(t - b.release - LOWER) / 5); // rows out, then settles
+    const x = b.drop.x + b.dx * away, z = b.drop.z + b.side * b.dist * away;
+    g.position.set(x, wave(x, z, t) + 0.05, z);
+    g.rotation.set(Math.sin(t * 0.9 + b.ph) * 0.05, -b.side * (Math.PI / 2) * 0.85 * Math.min(away * 3, 1), Math.sin(t * 1.1 + b.ph) * 0.06);
+  }
+
+  function placeSwimmer(r, t, pose) {
+    const g = r.group;
+    g.visible = r.ring.visible = r.splash.visible = false;
+    if (t < r.f - 1.2) return;
+    g.visible = true;
+    if (t < r.f) { // standing at the rail
+      g.position.copy(shipPoint(t, r.lx, 5.6, r.side * 1.85));
+      g.rotation.set(pose.rx, r.side > 0 ? 0 : Math.PI, pose.rz);
+      setArms(r.arms, 0.15);
+      return;
+    }
+    const u = t - r.f;
+    if (u < r.fall) { // jumping
+      g.position.set(r.P.x + r.v.x * u, r.P.y + r.v.y * u - 4.9 * u * u, r.P.z + r.v.z * u);
+      g.rotation.set(r.side * u * 1.8, r.yaw, 0);
+      setArms(r.arms, 2.6);
+      return;
+    }
+    const s = u - r.fall; // seconds in the water
+    const { x, z } = r.land;
+    const sea = wave(x, z, t);
+    if (s < 1.2) {
+      r.splash.visible = true;
+      r.splash.position.set(x, sea + 0.05, z);
+      r.splash.scale.setScalar(1 + s * 3);
+      r.splash.material.opacity = 1 - s / 1.2;
+    }
+    const drown = clamp((s - r.struggle) / 3, 0, 1);
+    if (drown < 1) { // struggling, then slipping under
+      g.position.set(x, sea - 0.8 * SCALE + Math.sin(t * 3 + r.ph) * 0.12 * (1 - drown) - ease(drown) * 2.4 * SCALE, z);
+      g.rotation.set(0, r.yaw, Math.sin(t * 2 + r.ph) * 0.15 * (1 - drown));
+      setArms(r.arms, (2.3 + Math.sin(t * 9 + r.ph) * 0.6) * (1 - drown * 0.6));
+    } else {
+      g.visible = false;
+    }
+    const belt = (s - r.struggle - 1.5) / 0.6; // the lifebelt stays on the surface
+    if (belt > 0) {
+      r.ring.visible = true;
+      r.ring.position.set(x, sea + 0.04, z);
+      r.ring.rotation.set(Math.sin(t * 1.3 + r.ph) * 0.08, 0, Math.cos(t * 1.1 + r.ph) * 0.08);
+      r.ring.scale.setScalar(Math.min(belt, 1));
+    }
+  }
+
+  // ---------- selection, hover, click ----------
+  const same = (a, b) => a.length === b.length && [...a].sort().join() === [...b].sort().join();
+  const isAll = (s) => same(s.sexes, ALL.sexes) && same(s.classes, ALL.classes) && same(s.outcomes, ALL.outcomes);
+  const matches = (r) => r.kind === "boat"
+    ? sel.outcomes.includes(1)
+    : sel.sexes.includes(r.sex) && sel.classes.includes(r.cls) && sel.outcomes.includes(r.survived);
+  const label = (r) => r.kind === "boat"
+    ? "Lifeboat · everyone who survived"
+    : `${r.sex === "female" ? "Woman" : "Man"} · ${CLASS_NAME[r.cls]} class · ${r.survived ? "Survived" : "Died"}`;
+  const targetSel = (r) => r.kind === "boat"
+    ? { sexes: ALL.sexes, classes: ALL.classes, outcomes: [1] }
+    : { sexes: [r.sex], classes: [r.cls], outcomes: [r.survived] };
+  const isCurrent = (r) => { const s = targetSel(r); return same(s.sexes, sel.sexes) && same(s.classes, sel.classes) && same(s.outcomes, sel.outcomes); };
+
+  function describe(s) {
+    if (!s.sexes.length || !s.classes.length || !s.outcomes.length) return "nobody";
+    if (isAll(s)) return "everyone";
+    const parts = [];
+    if (s.sexes.length === 1) parts.push(s.sexes[0] === "female" ? "women" : "men");
+    if (s.classes.length < 3) parts.push([...s.classes].sort().map((c) => CLASS_NAME[c]).join(" + ") + " class");
+    if (s.outcomes.length === 1) parts.push(s.outcomes[0] ? "survived" : "died");
+    return parts.join(" · ") || "everyone";
+  }
+
+  let hovered = null;
+  function paint(r) {
+    const on = matches(r), lit = r === hovered;
+    for (const m of r.mats) {
+      if (m.transparent === on) { m.transparent = !on; m.needsUpdate = true; }
+      m.opacity = on ? 1 : 0.18;
+      m.depthWrite = on;
+      m.emissive.setHex(lit ? 0x5a4a14 : 0x000000);
+    }
+  }
+  function applySelection() {
+    records.forEach(paint);
+    document.getElementById("filter").textContent = describe(sel);
+  }
+
+  function choose(r) {
+    sel = r === ALL || isCurrent(r) ? ALL : targetSel(r); // clicking the active group again shows everyone
+    applySelection();
+    send("streamlit:setComponentValue", { value: { ...sel, nonce: Date.now() }, dataType: "json" });
+  }
+
+  const ray = new THREE.Raycaster(), pointer = new THREE.Vector2();
+  const shown = (o) => { for (; o; o = o.parent) if (!o.visible) return false; return true; };
+  function pick(e) {
+    const box = canvas.getBoundingClientRect();
+    pointer.set(((e.clientX - box.left) / box.width) * 2 - 1, -((e.clientY - box.top) / box.height) * 2 + 1);
+    ray.setFromCamera(pointer, camera);
+    const hit = ray.intersectObjects(hitMeshes, false).find((h) => shown(h.object));
+    return hit ? hit.object.userData.target : null;
+  }
+  const tip = document.getElementById("tip");
+  function showTip(r, e) {
+    if (!r) { tip.style.display = "none"; return; }
+    tip.innerHTML = `${label(r)}<br><b>${r.n.toLocaleString()} passengers</b><br><small>${isCurrent(r) ? "Click again to show everyone" : "Click to filter the page"}</small>`;
+    tip.style.display = "block";
+    const x = Math.min(e.clientX + 14, innerWidth - tip.offsetWidth - 6);
+    const y = e.clientY + 16 + tip.offsetHeight > innerHeight ? e.clientY - tip.offsetHeight - 10 : e.clientY + 16;
+    tip.style.left = Math.max(x, 6) + "px";
+    tip.style.top = y + "px";
+  }
+  function hover(r, e) {
+    const prev = hovered;
+    hovered = r;
+    if (prev && prev !== r) paint(prev);
+    if (r) paint(r);
+    canvas.style.cursor = r ? "pointer" : "default";
+    showTip(r, e);
+  }
+  canvas.addEventListener("pointermove", (e) => hover(pick(e), e));
+  canvas.addEventListener("pointerleave", (e) => hover(null, e));
+  canvas.addEventListener("click", (e) => { const r = pick(e); if (r) { choose(r); hover(r, e); } });
+
+  // ---------- clock and controls ----------
+  const reduceMotion = matchMedia("(prefers-reduced-motion: reduce)").matches;
+  const AFTER = 40; // a moment after the sinking, when every boat and lifebelt is on the water
+  let t = reduceMotion ? AFTER : 0, paused = reduceMotion, last = performance.now();
+  const pauseBtn = document.getElementById("pause");
+  const syncPause = () => { pauseBtn.textContent = paused ? "Play" : "Pause"; };
+  syncPause();
+  pauseBtn.onclick = () => { paused = !paused; syncPause(); };
+  document.getElementById("replay").onclick = () => { t = 0; paused = false; syncPause(); };
+  document.getElementById("everyone").onclick = () => choose(ALL);
+
+  const note = document.getElementById("note");
+  function caption(t) {
+    if (t > SAIL && t < SAIL + 6) return "14 April 1912, 23:40 — Titanic strikes the iceberg";
+    if (t > SAIL + 6 && t < SAIL + 20) return "15 April, 02:20 — the ship goes down";
+    return "";
+  }
+
+  function frame(t) {
+    const pose = shipPose(t);
+    ship.position.set(pose.x, pose.y, 1.5);
+    ship.rotation.set(pose.rx, 0, pose.rz);
+    ship.visible = t < SAIL + SINK;
+    boats.forEach((b) => placeBoat(b, t, pose));
+    swimmers.forEach((r) => placeSwimmer(r, t, pose));
+
+    const text = caption(t);
+    if (text) note.textContent = text;
+    note.style.opacity = text ? 1 : 0;
+
+    for (let i = 0; i < seaPos.count; i++) seaPos.setY(i, wave(seaPos.getX(i), seaPos.getZ(i), t));
+    seaPos.needsUpdate = true;
+    seaGeo.computeVertexNormals();
+
+    // After the impact the camera closes in and slows down, so the boats and people are easy to click.
+    const near = ease(clamp((t - SAIL) / 6, 0, 1));
+    const angle = 0.9 + 0.14 * Math.min(t, SAIL) + 0.05 * Math.max(0, t - SAIL);
+    const radius = lerp(62, 42, near);
+    const cx = lerp(-12, -18, near), cy = lerp(3, 0.5, near), cz = lerp(0, 1.5, near);
+    const shake = paused ? 0 : Math.max(0, 1 - Math.abs(t - SAIL) * 1.5) * 0.8;
+    camera.position.set(
+      cx + Math.cos(angle) * radius + (Math.random() - 0.5) * shake,
+      lerp(17, 15, near) + (Math.random() - 0.5) * shake,
+      cz + Math.sin(angle) * radius
+    );
+    camera.lookAt(cx, cy, cz);
+    renderer.render(scene, camera);
+  }
+
+  // The iframe starts at zero height until Streamlit applies setFrameHeight, so check the size every frame.
+  let size = "";
+  function fit() {
+    if (size === innerWidth + "x" + innerHeight || !innerWidth || !innerHeight) return;
+    size = innerWidth + "x" + innerHeight;
+    renderer.setSize(innerWidth, innerHeight);
+    camera.aspect = innerWidth / innerHeight;
+    camera.updateProjectionMatrix();
+  }
+
+  renderer.setAnimationLoop((now) => {
+    if (!paused) t += Math.min((now - last) / 1000, 0.1);
+    last = now;
+    fit();
+    frame(t);
+  });
+</script>
+</body>
+</html>

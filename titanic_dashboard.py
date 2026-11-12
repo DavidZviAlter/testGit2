@@ -8,7 +8,7 @@ import streamlit as st
 import streamlit.components.v1 as components
 
 DATA = Path(__file__).with_name("data") / "titanic.csv"
-SCENE = Path(__file__).with_name("titanic_3d.html")
+SCENE_DIR = Path(__file__).with_name("scene")  # 3D scene; clicks on its boats and people come back as filters
 SHIP = Path(__file__).with_name("assets") / "titanic-departure.jpg"
 PAINTING = Path(__file__).with_name("assets") / "titanic-stower.jpg"
 SEX = {"male": "Male", "female": "Female"}
@@ -16,6 +16,8 @@ EMBARKED = {"C": "Cherbourg", "Q": "Queenstown", "S": "Southampton", "Unknown": 
 PARTY = {"alone": "Alone", "family": "With family"}
 CABIN = {"known": "Recorded", "unknown": "Not recorded"}
 OUTCOME = {1: "Survived", 0: "Died"}
+CLASSES = [1, 2, 3]
+PER_FIGURE = 15  # passengers represented by one figure in the 3D scene
 AGE_LABELS = ["0–10", "11–20", "21–30", "31–40", "41–50", "51–60", "61–80"]
 GOLD = "#d4af37"
 ICE = "#9ec3db"
@@ -45,6 +47,15 @@ def apply_filters(df, sexes, classes, ports, ages, keep_missing_age, outcomes, f
     ]
     known_age = out["Age"].between(ages[0], ages[1])
     return out[known_age | (out["Age"].isna() if keep_missing_age else False)]
+
+
+def scene_filters(click):
+    """Turn a click in the 3D scene into sex, class and outcome selections, keeping only known values."""
+    return {
+        "f_sex": [s for s in click.get("sexes", []) if s in SEX],
+        "f_class": [c for c in click.get("classes", []) if c in CLASSES],
+        "f_outcome": [o for o in click.get("outcomes", []) if o in OUTCOME],
+    }
 
 
 def themed(chart, height=280):
@@ -77,9 +88,12 @@ def _selfcheck():
     )
     got = apply_filters(sample, ["female"], [3], ["C"], (0, 30), True, [1], (0, 50), ["family"], ["known"])
     assert len(got) == 1 and pd.isna(got.iloc[0]["Age"])
+    picked = scene_filters({"sexes": ["female", "robot"], "classes": [1, 9], "outcomes": [1]})
+    assert picked == {"f_sex": ["female"], "f_class": [1], "f_outcome": [1]}
 
 
 _selfcheck()
+titanic_scene = components.declare_component("titanic_scene", path=str(SCENE_DIR))
 
 st.set_page_config(page_title="Titanic Survival", page_icon="⚓", layout="wide", initial_sidebar_state="expanded")
 st.markdown(
@@ -111,15 +125,24 @@ df = prepare(pd.read_csv(DATA))
 fare_max = int(df["Fare"].max()) + 1
 ship_rate = df["Survived"].mean()
 
+# The sidebar and the 3D scene share these three filters. A click in the scene arrives as the
+# component's value on the next run, before the widgets are drawn, so it can set them here.
+for key, value in {"f_sex": list(SEX), "f_class": CLASSES, "f_outcome": list(OUTCOME)}.items():
+    st.session_state.setdefault(key, value)
+click = st.session_state.get("scene")
+if click and click.get("nonce") != st.session_state.get("scene_nonce"):
+    st.session_state["scene_nonce"] = click.get("nonce")
+    st.session_state.update(scene_filters(click))
+
 with st.sidebar:
     st.header("Filters")
-    st.caption("Every tile on the page uses this selection.")
-    sexes = st.multiselect("Sex", list(SEX), default=list(SEX), format_func=SEX.get)
-    outcomes = st.multiselect("Outcome", list(OUTCOME), default=list(OUTCOME), format_func=OUTCOME.get)
+    st.caption("Every tile on the page uses this selection. Clicking a lifeboat, person or lifebelt in the 3D scene sets sex, class and outcome.")
+    sexes = st.multiselect("Sex", list(SEX), key="f_sex", format_func=SEX.get)
+    outcomes = st.multiselect("Outcome", list(OUTCOME), key="f_outcome", format_func=OUTCOME.get)
     parties = st.multiselect("Travel party", list(PARTY), default=list(PARTY), format_func=PARTY.get)
     cabins = st.multiselect("Cabin on the manifest", list(CABIN), default=list(CABIN), format_func=CABIN.get)
     st.divider()
-    classes = st.multiselect("Class", [1, 2, 3], default=[1, 2, 3], format_func=lambda c: f"Class {c}")
+    classes = st.multiselect("Class", CLASSES, key="f_class", format_func=lambda c: f"Class {c}")
     ports = st.multiselect("Port of embarkation", list(EMBARKED), default=list(EMBARKED), format_func=EMBARKED.get)
     ages = st.slider("Age", 0, 80, (0, 80))
     keep_missing_age = st.checkbox("Include passengers with unknown age", value=True)
@@ -134,7 +157,23 @@ st.write(
 photo, painting = st.columns(2, gap="large")
 photo.image(str(SHIP), use_container_width=True, caption="RMS Titanic leaving Southampton, 10 April 1912. Public domain.")
 painting.image(str(PAINTING), use_container_width=True, caption="Willy Stöwer, Untergang der Titanic, 1912. Public domain.")
-components.html(SCENE.read_text(encoding="utf-8"), height=400)
+st.subheader("The sinking")
+st.caption(
+    "After the collision the lifeboats are lowered and passengers jump into the sea. "
+    f"Each figure stands for about {PER_FIGURE} passengers. Click a lifeboat for all survivors, "
+    "or a person or lifebelt for their sex, class and outcome. Click it again to show everyone."
+)
+groups = [
+    {"sex": sex, "cls": int(cls), "survived": int(survived), "n": int(n)}
+    for (sex, cls, survived), n in df.groupby(["Sex", "Pclass", "Survived"]).size().items()
+]
+titanic_scene(
+    groups=groups,
+    per=PER_FIGURE,
+    selection={"sexes": sexes, "classes": classes, "outcomes": outcomes},
+    key="scene",
+    default=None,
+)
 
 if view.empty:
     st.warning("No passengers match these filters.")
